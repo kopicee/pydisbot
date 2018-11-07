@@ -4,7 +4,7 @@ def truncate(s, maxlen=15):
     return s
 
 
-async def partial_coro(coro, *args, **kwargs):
+def partial_coro(coro, *args, **kwargs):
     async def wrapper():
         return await coro(*args, **kwargs)
     return wrapper

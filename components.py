@@ -1,4 +1,4 @@
-from utils import truncate
+from pydisbot.utils import truncate
 
 class Response:
     def __init__(self, msg=None, embed=None, file=None):
@@ -15,11 +15,15 @@ class Response:
         return self.msg
 
     def __bool__(self):
-        return any(self.msg, self.embed, self.file)
+        return any([self.msg, self.embed, self.file])
 
     def __repr__(self):
         r = self._name
-        attachments = [self.embed and 'embed', self.file and 'file']
+        attachments = [
+            x for x in 
+            (self.embed and 'embed', self.file and 'file')
+            if x
+        ]
         if any(attachments):
             r += (' with ' + ' and '.join(attachments))
         if self.msg:

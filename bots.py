@@ -3,16 +3,16 @@ from collections import defaultdict
 
 import discord
 
-from auth import PrivilegeChecker
-from components import Response
-from utils import defaultmsgs, partial_coro
+from pydisbot.auth import PrivilegeChecker
+from pydisbot.components import Response
+from pydisbot.utils import partial_coro
 
-from config import appconfig, environment
+from pydisbot.config import defaults, defaultmsgs
 
 
 CUSTOM_EVENTS = [           # args:
-    'on_command',           # (command, message)
-    'on_invalid_command',   # (command)
+    'on_command',           # (message, command, argstr)
+    'on_invalid_command',   # (message, command)
     'on_own_message'        # (message)
 ]
 
@@ -56,14 +56,22 @@ class BasicDiscordBot:
     def __init__(self):
         self.client = discord.Client()
 
-        self.bot_prefix = appconfig.bot_prefix
-        self.admin_prefix = appconfig.admin_prefix
-
-        self.privcheck = PrivilegeChecker(client)
         self.event_handlers = defaultdict(list)
         self.commands = {}
+        self.privcheck = None
         self.async_tasks = []
 
+        self.feedback = {
+            'unauthorized': defaultmsgs.UNAUTHORIZED,
+            'invalid_command': defaultmsgs.INVALID_COMMAND
+        }
+        self.command_prefix = defaults.COMMAND_PREFIX
+        self.default_now_playing = defaults.NOW_PLAYING
+
+
+    def setup_auth(self, authfile_path):
+        self.privcheck = PrivilegeChecker(self.client, authfile_path)
+        self.async_tasks.append(self.privcheck.authcode_task)
 
     async def dispatch(self, channel, resp):
         """Sends Responses to the target channel"""
@@ -73,24 +81,24 @@ class BasicDiscordBot:
 
         # Most messages are just msg and/or embed
         if not file:
-            await client.send_message(channel, msg, embed=embed)
+            await self.client.send_message(channel, msg, embed=embed)
         else:
             # If there are files but not embed, send the message with the file
             if not embed:
-                await client.send_file(channel, file, content=msg)
+                await self.client.send_file(channel, file, content=msg)
             # Otherwise send the msg+embed first, then the file
             else:
-                await client.send_message(channel, msg, embed=embed)
-                await client.send_file(channel, file)
+                await self.client.send_message(channel, msg, embed=embed)
+                await self.client.send_file(channel, file)
 
 
     async def set_now_playing(self, text):
         """Convenience function for changing Now Playing display"""
         game = discord.Game(name=text)
-        await client.change_presence(game=game)
+        await self.client.change_presence(game=game)
 
 
-    def bind_to_event(self, coro, event):
+    def bind_to_event(self, event):
         """For binding handlers to discordpy and custom events
 
         You can use this as a decorator:
@@ -102,27 +110,58 @@ class BasicDiscordBot:
         from discordpy events can be found on:
             https://discordpy.readthedocs.io/en/latest/api.html
         """
-        if event not in DISCORDPY_EVENTS + CUSTOM_EVENTS:
-            raise ValueError('invalid event provided to '
-                             'bind_to_event(): ' + repr(event_name))
-        self.event_handlers[event].append(coro)
+        def decorator(coro):
+            if event not in DISCORDPY_EVENTS + CUSTOM_EVENTS:
+                raise ValueError('invalid event provided to '
+                                 'bind_to_event(): ' + repr(event_name))
+            self.event_handlers[event].append(coro)
+        return decorator
 
 
-    def bind_command(self, coro, keyword, privileged=False, hidden=False):
-        """Special case of binding to on_message
+    def bind_command(self, keyword, privileged=False, hidden=False):
+        """Factory that returns decorators that register commands to the bot.
 
-        Creates a special handler that checks the user's executing privileges
-        for the command.
+        Commands are specially handled cases in on_message.
+        This interface allows @bind_command(keyword='foo') to return a 
+        decorator that wraps the following function/coro declaration.
+
+        The returned decorator will associate the defined function with a
+        command keyword, which is used within on_message to pass arguments to
+        handler_on_command.
+
+        handler_on_command checks the user's executing context for privileges
+        and hidden commands.
         """
-        async def handler_on_command(message, argstr):
-            # Check privilege if needed
-            if privileged or hidden:
-                authorized = self.privcheck.has_privilege(message.author)
-                if not authorized and hidden:
+        def decorator(coro):
+            async def handler_on_command(message, comm, argstr):
+                # Hidden commands only take effect via private message
+                if hidden and not message.channel.is_private:
                     return
-                return defaultmsgs.UNAUTHORIZED
-            return await coro(message, argstr)
-        self.commands[keyword] = handler_on_command
+
+                # Check privilege if needed
+                authorized = True
+                if privileged:
+                    if not self.privcheck:
+                        e = (f"command '{comm}' required privileges but "
+                             "setup_auth() was never run")
+                        raise NotImplementedError(e)
+                    authorized = self.privcheck.has_privilege(message.author)
+
+                if not authorized:
+                    print(f'Blocked unauthorized user {str(message.author)} '
+                          f'from running command {comm}')
+                    if hidden:
+                        return
+                    else:
+                        return Response(msg=self.feedback['unauthorized'])
+
+                # Return if authorized and in the right channel
+                resp = await coro(message, argstr)
+                await self.dispatch(message.channel, resp)
+
+            # Associate this handler to the command
+            self.commands[keyword] = handler_on_command
+        return decorator
 
             
     async def trigger_event(self, event, *args, **kwargs):
@@ -148,26 +187,28 @@ class BasicDiscordBot:
                 await self.trigger_event('on_own_message', message))
         
         # Elif looks like command
-        elif message.content.startswith(self.bot_prefix):
-            # Remove leading bot_prefix; split into command and argstr
-            text = message.content.replace(self.bot_prefix, '')
+        elif message.content.startswith(self.command_prefix):
+            # Remove leading command_prefix; split into command and argstr
+            text = message.content.replace(self.command_prefix, '')
             keyword, *argstr = text.split(None, maxsplit=1)
             argstr = argstr[0] if argstr else ''
 
             # Check for valid command, trigger on_command
             handler = self.commands.get(keyword.strip())
             if handler:
-                responses.append(await handler(message, argstr))
+                responses.append(await handler(message, keyword, argstr))
                 responses.extend(
-                    await self.trigger_event('on_command', keyword, message))
+                    await self.trigger_event(
+                        'on_command', message, keyword, argstr))
                 
             # Handle invalid command
             else:
-                fargs = dict(prefix=self.bot_prefix, command=command)
-                msg = defaultmsgs.INVALID_COMMAND.format(**fargs)
+                fargs = dict(prefix=self.command_prefix, command=keyword)
+                msg = self.feedback['invalid_command'].format(**fargs)
                 responses.append(Response(msg))
                 responses.extend(
-                    await self.trigger_event('on_invalid_command', keyword))
+                    await self.trigger_event(
+                        'on_invalid_command', message, keyword))
             
         # Else just trigger on_message
         else:
@@ -191,10 +232,10 @@ class BasicDiscordBot:
                '  Invite link:\n'
                '    https://discordapp.com/oauth2/authorize?client_id={}&scope=bot&permissions=0\n'
                '------\n'
-        ).format(client.user.name, client.user.id)
+        ).format(self.client.user.name, self.client.user.id)
         print(msg)
         await self.trigger_event('on_ready')
-        await self.set_now_playing(appconfig.NOW_PLAYING)
+        await self.set_now_playing(self.default_now_playing)
 
 
     def attach_proxy_callback(self, event_name):
@@ -207,7 +248,7 @@ class BasicDiscordBot:
         attribute to the event_name, then attaches it to the client using 
         client.event()
         """
-        async def callback_on_event(*evtargs, **evtkwargs):
+        async def callback_on_event(*eventargs, **eventkwargs):
             """Emulates some callback handler, such as client.on_ready()
             
             Gathers output from coros in self.event_handlers[event_name] and
@@ -237,14 +278,37 @@ class BasicDiscordBot:
         self.client.event(callback_on_event)
 
 
-    def start(self):
+    def start(self, token, quickfail=False):
+        # Extra handler for quickfail
+        if quickfail:
+            @self.bind_to_event('on_error')
+            async def interrupt_on_error(*a, **k):
+                raise KeyboardInterrupt
+
         # Register custom event handlers
         for event in DISCORDPY_EVENTS + CUSTOM_EVENTS:
-            callback = getattr(self, event)
-            if callback:
+            if hasattr(self, event):
+                callback = getattr(self, event)
                 self.client.event(callback)
 
             elif self.event_handlers[event]:
-                attach_proxy_callback(event)
+                self.attach_proxy_callback(event)
 
-        client.run(environment.DISCORD)
+        # Register background coros
+        for awaitable in self.async_tasks:
+            self.client.loop.create_task(awaitable(self.client))
+
+        if not quickfail:
+            self.client.run(token)
+        
+        else:
+            try:
+                print('WARNING: Running on QUICKFAIL mode.\n'
+                      '         Errors will trigger client logout/shutdown.')
+                self.client.loop.run_until_complete(self.client.start(token))
+            except KeyboardInterrupt:
+                print('(QUICKFAIL) Halting...')
+                self.client.loop.run_until_complete(self.client.logout())
+                # cancel all tasks lingering
+            finally:
+                self.client.loop.close()
